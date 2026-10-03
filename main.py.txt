@@ -1,0 +1,94 @@
+import os
+from fastapi import FastAPI, Request
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from supabase import create_client
+
+app = FastAPI()
+
+# เตรียมระบบเชื่อมต่อ LINE และ Supabase โดยดึงรหัสลับจากเซิร์ฟเวอร์
+line_bot_api = LineBotApi(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
+handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET", ""))
+supabase = create_client(os.environ.get("SUPABASE_URL", ""), os.environ.get("SUPABASE_KEY", ""))
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    signature = request.headers.get("X-Line-Signature", "")
+    body = await request.body()
+    try:
+        handler.handle(body.decode("utf-8"), signature)
+    except InvalidSignatureError:
+        return {"error": "Invalid signature"}
+    return "OK"
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    text = event.message.text.strip()
+    reply_msg = "รูปแบบคำสั่ง:\nเช็กสต็อก: ? [SKU]\nรับเข้า: + [SKU] [จำนวน] [ทุน]\nขายออก: - [SKU] [จำนวน]"
+
+    try:
+        parts = text.split()
+        cmd = parts[0]
+
+        # 1. เช็กสต็อก และคำนวณต้นทุนเฉลี่ย
+        if cmd == "?":
+            sku = parts[1].upper()
+            res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).execute()
+            lots = res.data
+            total_qty = sum(lot["qty_remain"] for lot in lots)
+            
+            if total_qty == 0:
+                reply_msg = f"📦 {sku}\nสถานะ: สินค้าหมด (0 ชิ้น)"
+            else:
+                total_value = sum(lot["qty_remain"] * lot["unit_cost"] for lot in lots)
+                avg_cost = total_value / total_qty
+                reply_msg = f"📦 {sku}\n🟢 คงเหลือ: {total_qty} ชิ้น\n📊 ทุนเฉลี่ย: {avg_cost:.2f} บาท/ชิ้น"
+
+        # 2. รับของเข้า (แยก Lot)
+        elif cmd == "+":
+            sku = parts[1].upper()
+            qty = int(parts[2])
+            cost = float(parts[3])
+            
+            # เช็กว่ามีชื่อสินค้านี้หรือยัง ถ้าไม่มีให้สร้างอัตโนมัติ
+            p_res = supabase.table("products").select("*").eq("sku", sku).execute()
+            if not p_res.data:
+                supabase.table("products").insert({"sku": sku, "name": sku}).execute()
+            
+            # บันทึกล็อตใหม่
+            supabase.table("inventory_lots").insert({
+                "sku": sku, "qty_received": qty, "qty_remain": qty, "unit_cost": cost
+            }).execute()
+            reply_msg = f"✅ รับเข้าสำเร็จ\nSKU: {sku}\nเพิ่มสต็อก: {qty} ชิ้น\nต้นทุน: {cost} บาท/ชิ้น"
+
+        # 3. ขายของออก (ตัดสต็อกแบบ FIFO)
+        elif cmd == "-":
+            sku = parts[1].upper()
+            sell_qty = int(parts[2])
+            
+            # ดึงล็อตที่เก่าที่สุดมาก่อน
+            res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).order("created_at").execute()
+            lots = res.data
+            total_available = sum(lot["qty_remain"] for lot in lots)
+            
+            if total_available < sell_qty:
+                reply_msg = f"❌ สต็อกไม่พอ!\n{sku} มีของพร้อมขายแค่ {total_available} ชิ้น"
+            else:
+                remain_to_deduct = sell_qty
+                for lot in lots:
+                    if remain_to_deduct <= 0: 
+                        break
+                    if lot["qty_remain"] <= remain_to_deduct:
+                        remain_to_deduct -= lot["qty_remain"]
+                        supabase.table("inventory_lots").update({"qty_remain": 0}).eq("lot_id", lot["lot_id"]).execute()
+                    else:
+                        new_qty = lot["qty_remain"] - remain_to_deduct
+                        supabase.table("inventory_lots").update({"qty_remain": new_qty}).eq("lot_id", lot["lot_id"]).execute()
+                        remain_to_deduct = 0
+                reply_msg = f"📤 ตัดสต็อกสำเร็จ\nSKU: {sku}\nขายออก: {sell_qty} ชิ้น"
+
+    except Exception:
+        reply_msg = "❌ พิมพ์ผิดรูปแบบ กรุณาเว้นวรรคให้ถูกต้อง\nตัวอย่างรับเข้า: + A001 100 5.5"
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
