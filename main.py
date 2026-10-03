@@ -1,4 +1,5 @@
 import os
+import traceback
 from fastapi import FastAPI, Request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -25,8 +26,7 @@ async def webhook(request: Request):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = event.message.text.strip()
-    reply_msg = "คู่มือการใช้งาน:\n🔍 เช็กสต็อก: ? [SKU]\n📥 รับของเข้า: + [SKU] [จำนวน] [ทุน] [ชื่อสินค้า]\n📤 ตัดสต็อก: - [SKU] [จำนวน]"
-
+    
     try:
         parts = text.split()
         cmd = parts[0]
@@ -35,7 +35,6 @@ def handle_text_message(event):
         if cmd == "?":
             sku = parts[1].upper()
             
-            # หาชื่อสินค้าก่อน
             p_res = supabase.table("products").select("name").eq("sku", sku).execute()
             
             if not p_res.data:
@@ -43,7 +42,6 @@ def handle_text_message(event):
             else:
                 product_name = p_res.data[0]["name"]
                 
-                # หาสต็อกรวมและทุนเฉลี่ย
                 res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).execute()
                 lots = res.data
                 total_qty = sum(lot["qty_remain"] for lot in lots)
@@ -64,13 +62,10 @@ def handle_text_message(event):
             # ถ้ามีการพิมพ์ชื่อสินค้าต่อท้ายมาด้วย จะเอาไปใช้ตั้งชื่อ ถ้าไม่มีจะใช้ SKU เป็นชื่อแทน
             product_name = " ".join(parts[4:]) if len(parts) > 4 else sku
             
-            # เช็กว่ามีรหัสสินค้านี้ในระบบหรือยัง
             p_res = supabase.table("products").select("*").eq("sku", sku).execute()
             if not p_res.data:
-                # ถ้ายังไม่มีรหัสนี้ ให้เพิ่มชื่อสินค้าเข้าไปใหม่เลย
                 supabase.table("products").insert({"sku": sku, "name": product_name}).execute()
             
-            # บันทึกสต็อกล็อตใหม่เข้าโกดัง
             supabase.table("inventory_lots").insert({
                 "sku": sku, "qty_received": qty, "qty_remain": qty, "unit_cost": cost
             }).execute()
@@ -101,8 +96,12 @@ def handle_text_message(event):
                         supabase.table("inventory_lots").update({"qty_remain": new_qty}).eq("lot_id", lot["lot_id"]).execute()
                         remain_to_deduct = 0
                 reply_msg = f"📤 ตัดสต็อกสำเร็จ\nSKU: {sku}\nขายออก: {sell_qty} ชิ้น"
+        
+        # กรณีพิมพ์อย่างอื่นที่ไม่ได้ขึ้นต้นด้วย +, -, ?
+        else:
+            reply_msg = "คู่มือการใช้งาน:\n🔍 เช็กสต็อก: ? [SKU]\n📥 รับของเข้า: + [SKU] [จำนวน] [ทุน] [ชื่อสินค้า]\n📤 ตัดสต็อก: - [SKU] [จำนวน]"
 
-    except Exception:
-        reply_msg = "❌ พิมพ์ผิดรูปแบบ กรุณาเว้นวรรคให้ถูกต้อง\nรับเข้า: + A001 100 5.5 ชื่อสินค้า\nขายออก: - A001 50\nเช็กสต็อก: ? A001"
+    except Exception as e:
+        reply_msg = f"❌ เกิดข้อผิดพลาดหลังบ้าน:\nError: {type(e).__name__}\n{str(e)}\n\n(ก๊อปปี้ข้อความนี้ส่งให้ผมดูได้เลยครับ)"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
