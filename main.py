@@ -7,7 +7,7 @@ from supabase import create_client
 
 app = FastAPI()
 
-# เตรียมระบบเชื่อมต่อ LINE และ Supabase โดยดึงรหัสลับจากเซิร์ฟเวอร์
+# เชื่อมต่อ LINE และ Supabase
 line_bot_api = LineBotApi(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
 handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET", ""))
 supabase = create_client(os.environ.get("SUPABASE_URL", ""), os.environ.get("SUPABASE_KEY", ""))
@@ -25,49 +25,63 @@ async def webhook(request: Request):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = event.message.text.strip()
-    reply_msg = "รูปแบบคำสั่ง:\nเช็กสต็อก: ? [SKU]\nรับเข้า: + [SKU] [จำนวน] [ทุน]\nขายออก: - [SKU] [จำนวน]"
+    reply_msg = "คู่มือการใช้งาน:\n🔍 เช็กสต็อก: ? [SKU]\n📥 รับของเข้า: + [SKU] [จำนวน] [ทุน] [ชื่อสินค้า]\n📤 ตัดสต็อก: - [SKU] [จำนวน]"
 
     try:
         parts = text.split()
         cmd = parts[0]
 
-        # 1. เช็กสต็อก และคำนวณต้นทุนเฉลี่ย
+        # 1. เช็กสต็อก (ดึงชื่อจาก products และคำนวณต้นทุนจาก inventory_lots)
         if cmd == "?":
             sku = parts[1].upper()
-            res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).execute()
-            lots = res.data
-            total_qty = sum(lot["qty_remain"] for lot in lots)
             
-            if total_qty == 0:
-                reply_msg = f"📦 {sku}\nสถานะ: สินค้าหมด (0 ชิ้น)"
+            # หาชื่อสินค้าก่อน
+            p_res = supabase.table("products").select("name").eq("sku", sku).execute()
+            
+            if not p_res.data:
+                reply_msg = f"❌ ไม่พบข้อมูลสินค้ารหัส: {sku} ในระบบ"
             else:
-                total_value = sum(lot["qty_remain"] * lot["unit_cost"] for lot in lots)
-                avg_cost = total_value / total_qty
-                reply_msg = f"📦 {sku}\n🟢 คงเหลือ: {total_qty} ชิ้น\n📊 ทุนเฉลี่ย: {avg_cost:.2f} บาท/ชิ้น"
+                product_name = p_res.data[0]["name"]
+                
+                # หาสต็อกรวมและทุนเฉลี่ย
+                res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).execute()
+                lots = res.data
+                total_qty = sum(lot["qty_remain"] for lot in lots)
+                
+                if total_qty == 0:
+                    reply_msg = f"📦 {sku} : {product_name}\nสถานะ: สินค้าหมด (0 ชิ้น)"
+                else:
+                    total_value = sum(lot["qty_remain"] * lot["unit_cost"] for lot in lots)
+                    avg_cost = total_value / total_qty
+                    reply_msg = f"📦 {sku} : {product_name}\n🟢 คงเหลือ: {total_qty} ชิ้น\n📊 ทุนเฉลี่ย: {avg_cost:.2f} บาท/ชิ้น"
 
-        # 2. รับของเข้า (แยก Lot)
+        # 2. รับของเข้า (แยก Lot และสร้างชื่อสินค้าให้อัตโนมัติถ้ายังไม่มี)
         elif cmd == "+":
             sku = parts[1].upper()
             qty = int(parts[2])
             cost = float(parts[3])
             
-            # เช็กว่ามีชื่อสินค้านี้หรือยัง ถ้าไม่มีให้สร้างอัตโนมัติ
+            # ถ้ามีการพิมพ์ชื่อสินค้าต่อท้ายมาด้วย จะเอาไปใช้ตั้งชื่อ ถ้าไม่มีจะใช้ SKU เป็นชื่อแทน
+            product_name = " ".join(parts[4:]) if len(parts) > 4 else sku
+            
+            # เช็กว่ามีรหัสสินค้านี้ในระบบหรือยัง
             p_res = supabase.table("products").select("*").eq("sku", sku).execute()
             if not p_res.data:
-                supabase.table("products").insert({"sku": sku, "name": sku}).execute()
+                # ถ้ายังไม่มีรหัสนี้ ให้เพิ่มชื่อสินค้าเข้าไปใหม่เลย
+                supabase.table("products").insert({"sku": sku, "name": product_name}).execute()
             
-            # บันทึกล็อตใหม่
+            # บันทึกสต็อกล็อตใหม่เข้าโกดัง
             supabase.table("inventory_lots").insert({
                 "sku": sku, "qty_received": qty, "qty_remain": qty, "unit_cost": cost
             }).execute()
-            reply_msg = f"✅ รับเข้าสำเร็จ\nSKU: {sku}\nเพิ่มสต็อก: {qty} ชิ้น\nต้นทุน: {cost} บาท/ชิ้น"
+            
+            reply_msg = f"✅ รับเข้าสำเร็จ\nสินค้า: {product_name} ({sku})\nเพิ่มสต็อก: {qty} ชิ้น\nต้นทุน: {cost} บาท/ชิ้น"
 
         # 3. ขายของออก (ตัดสต็อกแบบ FIFO)
         elif cmd == "-":
             sku = parts[1].upper()
             sell_qty = int(parts[2])
             
-            # ดึงล็อตที่เก่าที่สุดมาก่อน
             res = supabase.table("inventory_lots").select("*").eq("sku", sku).gt("qty_remain", 0).order("created_at").execute()
             lots = res.data
             total_available = sum(lot["qty_remain"] for lot in lots)
@@ -89,6 +103,6 @@ def handle_text_message(event):
                 reply_msg = f"📤 ตัดสต็อกสำเร็จ\nSKU: {sku}\nขายออก: {sell_qty} ชิ้น"
 
     except Exception:
-        reply_msg = "❌ พิมพ์ผิดรูปแบบ กรุณาเว้นวรรคให้ถูกต้อง\nตัวอย่างรับเข้า: + A001 100 5.5"
+        reply_msg = "❌ พิมพ์ผิดรูปแบบ กรุณาเว้นวรรคให้ถูกต้อง\nรับเข้า: + A001 100 5.5 ชื่อสินค้า\nขายออก: - A001 50\nเช็กสต็อก: ? A001"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
